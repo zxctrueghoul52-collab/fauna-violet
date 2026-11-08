@@ -1,0 +1,12 @@
+const $=s=>document.querySelector(s);
+let allUsers=[];
+function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function showError(message){const node=$('#login-error');node.textContent=message;node.classList.remove('hidden')}
+function formatDate(value){if(!value)return'—';const date=new Date(`${value.replace(' ','T')}Z`);return Number.isNaN(date.getTime())?value:new Intl.DateTimeFormat('ru-RU',{dateStyle:'medium',timeStyle:'short'}).format(date)}
+function renderUsers(){const q=$('#user-search').value.trim().toLocaleLowerCase('ru');const rows=allUsers.filter(u=>`${u.id} ${u.email}`.toLocaleLowerCase('ru').includes(q));$('#users-body').innerHTML=rows.map(u=>`<tr><td>${u.id}</td><td>${esc(u.email)}</td><td>${esc(formatDate(u.created_at))}</td><td>${u.verified?'<span class="verified">Подтверждена</span>':'<span class="unverified">Не подтверждена</span>'}</td></tr>`).join('');$('#table-message').textContent=rows.length?`Показано: ${rows.length}`:'Пользователи не найдены.'}
+async function api(path,data){const response=await fetch(path,{method:data?'POST':'GET',headers:data?{'content-type':'application/json'}:{},body:data?JSON.stringify(data):undefined,credentials:'same-origin',cache:'no-store'});const result=await response.json();if(!response.ok)throw Error(result.error||'Не удалось выполнить запрос.');return result}
+async function loadDashboard(){const result=await api('/api/admin/users');allUsers=result.users;$('#total-users').textContent=result.summary.total;$('#verified-users').textContent=result.summary.verified;$('#pending-users').textContent=result.summary.total-result.summary.verified;$('#login-panel').classList.add('hidden');$('#dashboard').classList.remove('hidden');$('#table-message').textContent='';renderUsers()}
+$('#login-form').addEventListener('submit',async e=>{e.preventDefault();const btn=$('#login-submit');$('#login-error').classList.add('hidden');btn.disabled=true;btn.textContent='Проверка…';try{await api('/api/admin/login',{email:$('#admin-email').value,password:$('#admin-password').value});$('#admin-password').value='';await loadDashboard()}catch(err){showError(err.message)}finally{btn.disabled=false;btn.innerHTML='Войти <span>↗</span>'}});
+$('#logout-button').onclick=async()=>{try{await api('/api/admin/logout',{})}finally{allUsers=[];$('#dashboard').classList.add('hidden');$('#login-panel').classList.remove('hidden')}};
+$('#user-search').oninput=renderUsers;
+api('/api/admin/me').then(loadDashboard).catch(()=>{});
