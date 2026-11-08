@@ -63,7 +63,8 @@ async function route(req,res) {
             return send(res,502,{error:'Не удалось отправить письмо. Проверьте настройки почтового сервиса и попробуйте снова.'});
           }
         }
-        return send(res,200,{message:`Код отправлен на ${email}.`,...(mailer?{}:{devCode:code})});
+        const exposeDevCode=process.env.NODE_ENV!=='production' && !emailReady;
+        return send(res,200,{message:`Код отправлен на ${email}.`,...(exposeDevCode?{devCode:code}:{})});
       }
       if(url.pathname==='/api/verify' && req.method==='POST') {
         const email=String(input.email||'').trim().toLowerCase(), code=String(input.code||'').trim();
