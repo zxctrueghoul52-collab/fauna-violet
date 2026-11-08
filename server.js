@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT 
 CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS support_messages (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, sender TEXT NOT NULL CHECK(sender IN ('user','admin')), message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, read_by_admin INTEGER NOT NULL DEFAULT 0);`);
 const userColumns=new Set(db.prepare('PRAGMA table_info(users)').all().map(column=>column.name));
-for(const [name,definition] of Object.entries({subscription_plan:"TEXT NOT NULL DEFAULT 'free'",subscription_status:"TEXT NOT NULL DEFAULT 'active'",stripe_customer_id:'TEXT',stripe_subscription_id:'TEXT',subscription_period_end:'INTEGER',is_banned:'INTEGER NOT NULL DEFAULT 0',ban_reason:'TEXT',banned_at:'TEXT',admin_plan:"TEXT NOT NULL DEFAULT 'free'",admin_plan_until:'INTEGER',admin_plan_reason:'TEXT'})) if(!userColumns.has(name)) db.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
+for(const [name,definition] of Object.entries({subscription_plan:"TEXT NOT NULL DEFAULT 'free'",subscription_status:"TEXT NOT NULL DEFAULT 'active'",stripe_customer_id:'TEXT',stripe_subscription_id:'TEXT',subscription_period_end:'INTEGER',is_banned:'INTEGER NOT NULL DEFAULT 0',ban_reason:'TEXT',banned_at:'TEXT',admin_plan:"TEXT NOT NULL DEFAULT 'free'",admin_plan_until:'INTEGER',admin_plan_reason:'TEXT',avatar_data:'TEXT'})) if(!userColumns.has(name)) db.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
 db.exec(`CREATE TABLE IF NOT EXISTS animal_search_usage (subject TEXT NOT NULL, month TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(subject,month));`);
 db.exec(`CREATE TABLE IF NOT EXISTS admin_audit (id INTEGER PRIMARY KEY, admin_email TEXT NOT NULL, target_user_id INTEGER, target_email TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
 const PLANS={free:{id:'free',name:'Free',pricePlnCents:0,monthlySearchLimit:25,description:'25 поисков по каталогу в месяц'},pro:{id:'pro',name:'Pro',pricePlnCents:299,monthlySearchLimit:500,description:'500 поисков по каталогу в месяц'},ultra:{id:'ultra',name:'Ultra',pricePlnCents:499,monthlySearchLimit:5000,description:'5 000 поисков по каталогу в месяц'}};
@@ -37,11 +37,11 @@ const mailer = smtpReady ? nodemailer.createTransport({ host: process.env.SMTP_H
 const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.svg':'image/svg+xml' };
 
 function send(res, status, data, cookie='') { res.writeHead(status, { 'content-type':'application/json; charset=utf-8', 'set-cookie': cookie, 'cache-control':'no-store', 'x-content-type-options':'nosniff', 'x-frame-options':'DENY', 'referrer-policy':'no-referrer' }); res.end(JSON.stringify(data)); }
-async function body(req) { let s=''; for await (const c of req) { s+=c; if (s.length>12000) throw Error('too large'); } return JSON.parse(s || '{}'); }
+async function body(req,max=12000) { let s=''; for await (const c of req) { s+=c; if (s.length>max) throw Error('too large'); } return JSON.parse(s || '{}'); }
 async function rawBody(req,max=200000) { const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>max)throw Error('too large');chunks.push(chunk)}return Buffer.concat(chunks); }
 function emailOk(x) { return typeof x==='string' && x.length<=254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x); }
 function sessionToken(req) { return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_session='))?.split('=')[1]; }
-function sessionUser(req) { const token=sessionToken(req),email=token&&sessions.get(token);if(!email)return null;const user=db.prepare('SELECT id,email,verified,subscription_plan,subscription_status,stripe_customer_id,stripe_subscription_id,subscription_period_end,is_banned,ban_reason,admin_plan,admin_plan_until FROM users WHERE email=?').get(email);return user&&!user.is_banned?user:null; }
+function sessionUser(req) { const token=sessionToken(req),email=token&&sessions.get(token);if(!email)return null;const user=db.prepare('SELECT id,email,verified,avatar_data,subscription_plan,subscription_status,stripe_customer_id,stripe_subscription_id,subscription_period_end,is_banned,ban_reason,admin_plan,admin_plan_until FROM users WHERE email=?').get(email);return user&&!user.is_banned?user:null; }
 function effectivePlan(user) { if(user&&['pro','ultra'].includes(user.admin_plan)&&Number(user.admin_plan_until)>Date.now())return user.admin_plan;return user&&['pro','ultra'].includes(user.subscription_plan)&&['active','trialing'].includes(user.subscription_status)?user.subscription_plan:'free'; }
 function searchSubject(req,user) { if(user)return `user:${user.id}`;const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',').at(-1).trim();return `guest:${createHash('sha256').update(`${process.env.CODE_PEPPER||'fauna-violet'}:${ip}`).digest('hex')}`; }
 function currentMonth() { return new Date().toISOString().slice(0,7); }
@@ -69,7 +69,7 @@ async function route(req,res) {
   if (url.pathname.startsWith('/api/')) {
     try {
       if(url.pathname==='/api/stripe/webhook'&&req.method==='POST'){if(!process.env.STRIPE_WEBHOOK_SECRET)return send(res,503,{error:'Stripe webhook is not configured.'});return await handleStripeWebhook(req,res)}
-      const input=['POST','DELETE'].includes(req.method) ? await body(req) : {};
+      const input=['POST','DELETE'].includes(req.method) ? await body(req,url.pathname==='/api/profile/avatar'?180000:12000) : {};
       if(url.pathname==='/api/plans'&&req.method==='GET') { const user=sessionUser(req),month=currentMonth(),subject=searchSubject(req,user),usage=db.prepare('SELECT used FROM animal_search_usage WHERE subject=? AND month=?').get(subject,month)?.used||0,plan=effectivePlan(user);return send(res,200,{plans:Object.values(PLANS),currentPlan:plan,searchesUsed:usage,searchLimit:PLANS[plan].monthlySearchLimit,checkoutReady:stripeReady,hasSubscription:!!(user?.stripe_subscription_id&&['active','trialing','past_due'].includes(user.subscription_status))}); }
       if(url.pathname==='/api/checkout'&&req.method==='POST') {
         const user=sessionUser(req);if(!user?.verified)return send(res,401,{error:'Войдите в подтверждённый аккаунт, чтобы оформить подписку.'});
@@ -294,7 +294,7 @@ async function route(req,res) {
         db.prepare('INSERT INTO users(email,password_hash,verified) VALUES(?,?,1)').run(email,`${pending.salt}:${pending.hash}`);
         db.prepare('DELETE FROM verification_codes WHERE email=?').run(email); pendingPasswords.delete(email);
         const token=randomBytes(32).toString('hex'); sessions.set(token,email);
-        return send(res,200,{user:{email} },`fauna_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`);
+        return send(res,200,{user:{email,avatarData:''} },`fauna_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`);
       }
       if(url.pathname==='/api/login' && req.method==='POST') {
         const email=String(input.email||'').trim().toLowerCase(), password=String(input.password||'');
@@ -304,9 +304,10 @@ async function route(req,res) {
         if(!timingSafeEqual(actual,Buffer.from(hash,'hex'))) return send(res,401,{error:'Неверная почта или пароль.'});
         if(user.is_banned)return send(res,403,{error:`Аккаунт заблокирован администратором.${user.ban_reason?` Причина: ${user.ban_reason}`:''}`});
         const token=randomBytes(32).toString('hex'); sessions.set(token,email);
-        return send(res,200,{user:{email}},`fauna_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`);
+        return send(res,200,{user:{email,avatarData:user.avatar_data||''}},`fauna_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`);
       }
-      if(url.pathname==='/api/me' && req.method==='GET') { const u=sessionUser(req); return send(res,200,{user:u?.verified?{email:u.email}:null}); }
+      if(url.pathname==='/api/profile/avatar'&&req.method==='POST') { const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Войдите в подтверждённый аккаунт.'});const data=input.avatarData;if(data===''){db.prepare('UPDATE users SET avatar_data=NULL WHERE id=?').run(account.id);return send(res,200,{avatarData:''})}if(typeof data!=='string'||data.length>165000||!/^data:image\/webp;base64,[A-Za-z0-9+/]+={0,2}$/.test(data))return send(res,400,{error:'Загрузите фото в формате PNG, JPG или WebP.'});const bytes=Buffer.from(data.slice(data.indexOf(',')+1),'base64');if(bytes.length>120*1024||bytes.toString('ascii',0,4)!=='RIFF'||bytes.toString('ascii',8,12)!=='WEBP')return send(res,400,{error:'Фото слишком большое или его формат не поддерживается.'});db.prepare('UPDATE users SET avatar_data=? WHERE id=?').run(data,account.id);return send(res,200,{avatarData:data})}
+      if(url.pathname==='/api/me' && req.method==='GET') { const u=sessionUser(req); return send(res,200,{user:u?.verified?{email:u.email,avatarData:u.avatar_data||''}:null}); }
       if(url.pathname==='/api/logout' && req.method==='POST') { const token=(req.headers.cookie||'').match(/(?:^|;\s*)fauna_session=([^;]+)/)?.[1]; if(token) sessions.delete(token); return send(res,200,{ok:true},'fauna_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); }
       if(url.pathname==='/api/animals' && req.method==='GET') { const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Войдите, чтобы открыть каталог животных.'});return send(res,200,{animals:animals.map(a=>({...a,image:animalPhotos[a.id]}))}); }
       return send(res,404,{error:'Не найдено.'});
