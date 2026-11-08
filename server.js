@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { mkdirSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
-import { randomInt, randomBytes, scrypt as scryptCb, timingSafeEqual, createHash } from 'node:crypto';
+import { randomInt, randomBytes, scrypt as scryptCb, timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import nodemailer from 'nodemailer';
@@ -16,6 +16,11 @@ db.exec(`PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS support_messages (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, sender TEXT NOT NULL CHECK(sender IN ('user','admin')), message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, read_by_admin INTEGER NOT NULL DEFAULT 0);`);
+const userColumns=new Set(db.prepare('PRAGMA table_info(users)').all().map(column=>column.name));
+for(const [name,definition] of Object.entries({subscription_plan:"TEXT NOT NULL DEFAULT 'free'",subscription_status:"TEXT NOT NULL DEFAULT 'active'",stripe_customer_id:'TEXT',stripe_subscription_id:'TEXT',subscription_period_end:'INTEGER',is_banned:'INTEGER NOT NULL DEFAULT 0',ban_reason:'TEXT',banned_at:'TEXT'})) if(!userColumns.has(name)) db.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
+db.exec(`CREATE TABLE IF NOT EXISTS animal_search_usage (subject TEXT NOT NULL, month TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(subject,month));`);
+const PLANS={free:{id:'free',name:'Free',pricePlnCents:0,monthlySearchLimit:25,description:'25 поисков по каталогу в месяц'},pro:{id:'pro',name:'Pro',pricePlnCents:299,monthlySearchLimit:500,description:'500 поисков по каталогу в месяц'},ultra:{id:'ultra',name:'Ultra',pricePlnCents:499,monthlySearchLimit:5000,description:'5 000 поисков по каталогу в месяц'}};
+const stripeReady=!!(process.env.STRIPE_SECRET_KEY&&process.env.STRIPE_WEBHOOK_SECRET);
 const sessions = new Map();
 const adminSessions = new Map();
 const adminFailures = new Map();
@@ -32,11 +37,20 @@ const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf
 
 function send(res, status, data, cookie='') { res.writeHead(status, { 'content-type':'application/json; charset=utf-8', 'set-cookie': cookie, 'cache-control':'no-store', 'x-content-type-options':'nosniff', 'x-frame-options':'DENY', 'referrer-policy':'no-referrer' }); res.end(JSON.stringify(data)); }
 async function body(req) { let s=''; for await (const c of req) { s+=c; if (s.length>12000) throw Error('too large'); } return JSON.parse(s || '{}'); }
+async function rawBody(req,max=200000) { const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>max)throw Error('too large');chunks.push(chunk)}return Buffer.concat(chunks); }
 function emailOk(x) { return typeof x==='string' && x.length<=254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x); }
-function sessionUser(req) { const raw=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_session='))?.split('=')[1]; const email=raw && sessions.get(raw); return email ? db.prepare('SELECT id,email,verified FROM users WHERE email=?').get(email) : null; }
+function sessionToken(req) { return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_session='))?.split('=')[1]; }
+function sessionUser(req) { const token=sessionToken(req),email=token&&sessions.get(token);if(!email)return null;const user=db.prepare('SELECT id,email,verified,subscription_plan,subscription_status,stripe_customer_id,stripe_subscription_id,subscription_period_end,is_banned,ban_reason FROM users WHERE email=?').get(email);return user&&!user.is_banned?user:null; }
+function effectivePlan(user) { return user&&['pro','ultra'].includes(user.subscription_plan)&&['active','trialing'].includes(user.subscription_status)?user.subscription_plan:'free'; }
+function searchSubject(req,user) { if(user)return `user:${user.id}`;const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',').at(-1).trim();return `guest:${createHash('sha256').update(`${process.env.CODE_PEPPER||'fauna-violet'}:${ip}`).digest('hex')}`; }
+function currentMonth() { return new Date().toISOString().slice(0,7); }
 function adminToken(req) { return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_admin='))?.slice('fauna_admin='.length); }
 function isAdmin(req) { const token=adminToken(req), expires=token&&adminSessions.get(token); if(!expires)return false; if(expires<Date.now()){adminSessions.delete(token);return false} adminSessions.set(token,Date.now()+60*60*1000); return true; }
 function fixedEqual(a,b) { return timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest()); }
+function validStripeSignature(raw,header,secret) { const values=String(header||'').split(',').map(x=>x.split('=')),timestamp=values.find(x=>x[0]==='t')?.[1],signatures=values.filter(x=>x[0]==='v1').map(x=>x[1]);if(!timestamp||Math.abs(Date.now()/1000-Number(timestamp))>300)return false;const expected=createHmac('sha256',secret).update(`${timestamp}.${raw}`).digest('hex');return signatures.some(signature=>fixedEqual(signature,expected)); }
+async function stripeRequest(path,method='POST',form) { const response=await fetch(`https://api.stripe.com/v1/${path}`,{method,headers:{Authorization:`Bearer ${process.env.STRIPE_SECRET_KEY}`,...(form?{'Content-Type':'application/x-www-form-urlencoded'}:{})},body:form?.toString(),signal:AbortSignal.timeout(20000)});const data=await response.json();if(!response.ok)throw Error(`Stripe API HTTP ${response.status}: ${String(data.error?.message||'Request failed').slice(0,250)}`);return data; }
+function applyStripeSubscription(subscription,eventType) { const userId=Number(subscription.metadata?.user_id||0),plan=subscription.metadata?.plan;const user=(userId&&db.prepare('SELECT id FROM users WHERE id=?').get(userId))||db.prepare('SELECT id FROM users WHERE stripe_subscription_id=? OR stripe_customer_id=?').get(subscription.id,subscription.customer);if(!user)return;const active=eventType!=='customer.subscription.deleted'&&['active','trialing'].includes(subscription.status)&&PLANS[plan]&&plan!=='free';const nextPlan=active?plan:'free',nextStatus=eventType==='customer.subscription.deleted'?'canceled':String(subscription.status||'inactive');db.prepare('UPDATE users SET subscription_plan=?,subscription_status=?,stripe_subscription_id=?,stripe_customer_id=?,subscription_period_end=? WHERE id=?').run(nextPlan,nextStatus,subscription.id||null,subscription.customer||null,Number(subscription.current_period_end||0)||null,user.id); }
+async function handleStripeWebhook(req,res) { const raw=await rawBody(req),signature=req.headers['stripe-signature'];if(!validStripeSignature(raw,signature,process.env.STRIPE_WEBHOOK_SECRET||''))return send(res,400,{error:'Недействительная подпись Stripe.'});let event;try{event=JSON.parse(raw.toString('utf8'))}catch{return send(res,400,{error:'Некорректное событие Stripe.'})}const object=event.data?.object||{};try{if(event.type==='checkout.session.completed'&&object.mode==='subscription'&&object.payment_status==='paid'){const userId=Number(object.metadata?.user_id||0),plan=object.metadata?.plan;if(userId&&PLANS[plan]&&plan!=='free')db.prepare("UPDATE users SET stripe_customer_id=?,stripe_subscription_id=?,subscription_plan=?,subscription_status='active' WHERE id=?").run(object.customer,object.subscription,plan,userId);}else if(event.type?.startsWith('customer.subscription.'))applyStripeSubscription(object,event.type);else if(event.type==='invoice.payment_failed'){const customer=String(object.customer||'');if(customer)db.prepare("UPDATE users SET subscription_plan='free',subscription_status='past_due' WHERE stripe_customer_id=?").run(customer)}return send(res,200,{received:true})}catch(err){console.error('Stripe webhook processing failed:',err.message);return send(res,500,{error:'Не удалось применить событие Stripe.'})} }
 async function fetchTaxa(url,options) { const waitFor=taxaQueue;let release;taxaQueue=new Promise(resolve=>release=resolve);await waitFor;const delay=Math.max(0,1000-(Date.now()-taxaLastRequest));if(delay)await new Promise(resolve=>setTimeout(resolve,delay));taxaLastRequest=Date.now();try{return await fetch(url,options)}finally{release()} }
 async function sendEmail(to,subject,textBody,htmlBody) {
   if(brevoReady) {
@@ -52,7 +66,22 @@ async function route(req,res) {
   const url=new URL(req.url,'http://localhost');
   if (url.pathname.startsWith('/api/')) {
     try {
-      const input=['POST'].includes(req.method) ? await body(req) : {};
+      if(url.pathname==='/api/stripe/webhook'&&req.method==='POST'){if(!process.env.STRIPE_WEBHOOK_SECRET)return send(res,503,{error:'Stripe webhook is not configured.'});return await handleStripeWebhook(req,res)}
+      const input=['POST','DELETE'].includes(req.method) ? await body(req) : {};
+      if(url.pathname==='/api/plans'&&req.method==='GET') { const user=sessionUser(req),month=currentMonth(),subject=searchSubject(req,user),usage=db.prepare('SELECT used FROM animal_search_usage WHERE subject=? AND month=?').get(subject,month)?.used||0,plan=effectivePlan(user);return send(res,200,{plans:Object.values(PLANS),currentPlan:plan,searchesUsed:usage,searchLimit:PLANS[plan].monthlySearchLimit,checkoutReady:stripeReady,hasSubscription:!!(user?.stripe_subscription_id&&['active','trialing','past_due'].includes(user.subscription_status))}); }
+      if(url.pathname==='/api/checkout'&&req.method==='POST') {
+        const user=sessionUser(req);if(!user?.verified)return send(res,401,{error:'Войдите в подтверждённый аккаунт, чтобы оформить подписку.'});
+        const plan=String(input.plan||'');if(!['pro','ultra'].includes(plan))return send(res,400,{error:'Выберите тариф Pro или Ultra.'});
+        if(!stripeReady)return send(res,503,{error:'Покупка пока не подключена. Администратору нужно настроить STRIPE_SECRET_KEY и STRIPE_WEBHOOK_SECRET.'});
+        if(user.stripe_subscription_id&&['active','trialing','past_due'].includes(user.subscription_status))return send(res,409,{error:'У вас уже есть подписка. Откройте управление подпиской.'});
+        const siteUrl=String(process.env.PUBLIC_URL||'https://faunaviolet.com').replace(/\/$/,''),price=PLANS[plan];
+        try { const form=new URLSearchParams();form.set('mode','subscription');form.set('success_url',`${siteUrl}/?billing=success`);form.set('cancel_url',`${siteUrl}/?billing=cancel`);form.set('customer_email',user.email);form.set('client_reference_id',String(user.id));form.set('payment_method_types[0]','card');form.set('line_items[0][price_data][currency]','pln');form.set('line_items[0][price_data][unit_amount]',String(price.pricePlnCents));form.set('line_items[0][price_data][recurring][interval]','month');form.set('line_items[0][price_data][product_data][name]',`Fauna Violet ${price.name}`);form.set('line_items[0][price_data][product_data][description]',price.description);form.set('metadata[user_id]',String(user.id));form.set('metadata[plan]',plan);form.set('subscription_data[metadata][user_id]',String(user.id));form.set('subscription_data[metadata][plan]',plan);const checkout=await stripeRequest('checkout/sessions','POST',form);return send(res,200,{url:checkout.url}); }
+        catch(err){console.error('Stripe checkout failed:',err.message);return send(res,502,{error:'Не удалось открыть безопасную оплату. Попробуйте позже.'})}
+      }
+      if(url.pathname==='/api/billing/portal'&&req.method==='POST') {
+        const user=sessionUser(req);if(!user?.verified)return send(res,401,{error:'Войдите в аккаунт.'});if(!stripeReady||!user.stripe_customer_id)return send(res,404,{error:'Для этого аккаунта пока нет подписки Stripe.'});
+        try {const form=new URLSearchParams({customer:user.stripe_customer_id,return_url:String(process.env.PUBLIC_URL||'https://faunaviolet.com')});const portal=await stripeRequest('billing_portal/sessions','POST',form);return send(res,200,{url:portal.url})}catch(err){console.error('Stripe portal failed:',err.message);return send(res,502,{error:'Не удалось открыть управление подпиской.'})}
+      }
       if(url.pathname==='/api/admin/login' && req.method==='POST') {
         const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',').at(-1).trim();
         const attempt=adminFailures.get(ip), now=Date.now();
@@ -70,9 +99,21 @@ async function route(req,res) {
       if(url.pathname==='/api/admin/logout' && req.method==='POST') { const token=adminToken(req);if(token)adminSessions.delete(token);return send(res,200,{ok:true},'fauna_admin=; HttpOnly; SameSite=Strict; Path=/api/admin; Max-Age=0'+(process.env.NODE_ENV==='production'?'; Secure':'')); }
       if(url.pathname==='/api/admin/users' && req.method==='GET') {
         if(!isAdmin(req)) return send(res,401,{error:'Требуется вход администратора.'});
-        const rows=db.prepare('SELECT id,email,verified,created_at FROM users ORDER BY id DESC').all();
+        const rows=db.prepare("SELECT u.id,u.email,u.verified,u.created_at,u.subscription_plan,u.subscription_status,u.subscription_period_end,u.is_banned,u.ban_reason,COALESCE((SELECT used FROM animal_search_usage WHERE subject='user:'||u.id AND month=?),0) AS searches_used FROM users u ORDER BY u.id DESC").all(currentMonth());
         const summary=db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified FROM users').get();
         return send(res,200,{users:rows,summary:{total:summary.total,verified:summary.verified||0}});
+      }
+      const adminBan=url.pathname.match(/^\/api\/admin\/users\/(\d+)\/(ban|unban)$/);
+      if(adminBan&&req.method==='POST') {
+        if(!isAdmin(req))return send(res,401,{error:'Требуется вход администратора.'});const userId=Number(adminBan[1]),action=adminBan[2],account=db.prepare('SELECT id,email FROM users WHERE id=?').get(userId);if(!account)return send(res,404,{error:'Пользователь не найден.'});
+        if(account.email===String(process.env.ADMIN_EMAIL||'').trim().toLowerCase())return send(res,400,{error:'Нельзя блокировать административный аккаунт.'});
+        if(action==='ban'){const reason=String(input.reason||'Нарушение правил').trim().slice(0,300);const billing=db.prepare('SELECT stripe_subscription_id,subscription_status FROM users WHERE id=?').get(userId);if(billing.stripe_subscription_id&&['active','trialing','past_due'].includes(billing.subscription_status)){if(!process.env.STRIPE_SECRET_KEY)return send(res,503,{error:'Сначала отмените подписку этого пользователя в Stripe.'});try{await stripeRequest('subscriptions/'+encodeURIComponent(billing.stripe_subscription_id),'DELETE')}catch(err){console.error('Stripe cancellation before ban failed:',err.message);return send(res,502,{error:'Не удалось отменить подписку в Stripe; блокировка не применена.'})}}db.prepare('UPDATE users SET is_banned=1,ban_reason=?,banned_at=CURRENT_TIMESTAMP WHERE id=?').run(reason,userId);for(const [token,email] of sessions)if(email===account.email)sessions.delete(token)}else db.prepare('UPDATE users SET is_banned=0,ban_reason=NULL,banned_at=NULL WHERE id=?').run(userId);
+        return send(res,200,{ok:true});
+      }
+      const adminUserDelete=url.pathname.match(/^\/api\/admin\/users\/(\d+)$/);
+      if(adminUserDelete&&req.method==='DELETE') {
+        if(!isAdmin(req))return send(res,401,{error:'Требуется вход администратора.'});const userId=Number(adminUserDelete[1]),account=db.prepare('SELECT id,email,stripe_subscription_id,subscription_status FROM users WHERE id=?').get(userId);if(!account)return send(res,404,{error:'Пользователь не найден.'});if(account.email===String(process.env.ADMIN_EMAIL||'').trim().toLowerCase())return send(res,400,{error:'Нельзя удалить административный аккаунт.'});if(account.stripe_subscription_id&&['active','trialing','past_due'].includes(account.subscription_status)){if(!process.env.STRIPE_SECRET_KEY)return send(res,503,{error:'Сначала отмените подписку этого пользователя в Stripe.'});try{await stripeRequest('subscriptions/'+encodeURIComponent(account.stripe_subscription_id),'DELETE')}catch(err){console.error('Stripe cancellation before account deletion failed:',err.message);return send(res,502,{error:'Не удалось отменить подписку; аккаунт не удалён.'})}}
+        db.prepare('DELETE FROM support_messages WHERE user_id=?').run(userId);db.prepare('DELETE FROM animal_search_usage WHERE subject=?').run(`user:${userId}`);db.prepare('DELETE FROM verification_codes WHERE email=?').run(account.email);db.prepare('DELETE FROM users WHERE id=?').run(userId);for(const [token,email] of sessions)if(email===account.email)sessions.delete(token);return send(res,200,{ok:true});
       }
       if(url.pathname==='/api/admin/support' && req.method==='GET') {
         if(!isAdmin(req)) return send(res,401,{error:'Требуется вход администратора.'});
@@ -112,13 +153,16 @@ async function route(req,res) {
       if(url.pathname==='/api/animals/search' && req.method==='GET') {
         const q=String(url.searchParams.get('q')||'').trim().slice(0,100);
         if(q.length<2)return send(res,200,{animals:[]});
+        const account=sessionUser(req),subject=searchSubject(req,account),month=currentMonth(),plan=effectivePlan(account),limit=PLANS[plan].monthlySearchLimit,used=db.prepare('SELECT used FROM animal_search_usage WHERE subject=? AND month=?').get(subject,month)?.used||0;
+        if(used>=limit)return send(res,429,{error:`Лимит поиска на тарифе ${PLANS[plan].name} исчерпан (${limit} поисков в месяц). Перейдите на Pro или Ultra.`,plan,used,limit});
         const cacheKey=q.toLocaleLowerCase('ru');let results=taxaCache.get(cacheKey);
         if(!results||results.until<Date.now()) {
           const apiUrl=new URL('https://api.inaturalist.org/v1/taxa/autocomplete');apiUrl.searchParams.set('q',q);apiUrl.searchParams.set('per_page','20');apiUrl.searchParams.set('locale','ru');apiUrl.searchParams.set('taxon_id','2');
           try { const response=await fetchTaxa(apiUrl,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(12000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json();results=(data.results||[]).filter(t=>t.is_active&&['species','subspecies'].includes(t.rank)&&(t.default_photo?.medium_url||t.default_photo?.square_url)).map(t=>{const icons={Mammalia:'🐾',Aves:'🐦',Amphibia:'🐸',Reptilia:'🦎',Actinopterygii:'🐟',Insecta:'🦋',Arachnida:'🕷️',Mollusca:'🐙',Annelida:'🪱',Chromista:'🪸'};return {id:`inat-${t.id}`,taxonId:t.id,name:t.preferred_common_name||t.name,latin:t.name,group:'Онлайн-каталог',emoji:icons[t.iconic_taxon_name]||'🐾',color:'#65537f',image:t.default_photo?.medium_url||t.default_photo?.square_url,observationsCount:t.observations_count,rank:t.rank,sourceUrl:`https://www.inaturalist.org/taxa/${t.id}`,detail:`Вид из международного каталога iNaturalist. На платформе зарегистрировано наблюдений: ${Number(t.observations_count||0).toLocaleString('ru-RU')}.`};});taxaCache.set(cacheKey,{until:Date.now()+10*60*1000,results});if(taxaCache.size>150)taxaCache.delete(taxaCache.keys().next().value); }
           catch(err) { console.error(`iNaturalist search failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось выполнить поиск по каталогу видов. Попробуйте позже.'}); }
         }
-        return send(res,200,{animals:results,source:'iNaturalist'});
+        db.prepare('INSERT INTO animal_search_usage(subject,month,used) VALUES(?,?,1) ON CONFLICT(subject,month) DO UPDATE SET used=used+1').run(subject,month);
+        return send(res,200,{animals:results,source:'iNaturalist',searchesUsed:used+1,searchLimit:limit,plan});
       }
       if(url.pathname==='/api/animals/detail' && req.method==='GET') {
         const id=Number(url.searchParams.get('id'));if(!Number.isSafeInteger(id)||id<1)return send(res,400,{error:'Некорректный ID вида.'});
@@ -205,6 +249,7 @@ async function route(req,res) {
         if(!user) return send(res,401,{error:'Неверная почта или пароль.'});
         const [salt,hash]=user.password_hash.split(':'), actual=await scrypt(password,salt,64);
         if(!timingSafeEqual(actual,Buffer.from(hash,'hex'))) return send(res,401,{error:'Неверная почта или пароль.'});
+        if(user.is_banned)return send(res,403,{error:`Аккаунт заблокирован администратором.${user.ban_reason?` Причина: ${user.ban_reason}`:''}`});
         const token=randomBytes(32).toString('hex'); sessions.set(token,email);
         return send(res,200,{user:{email}},`fauna_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`);
       }
