@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash
 const sessions = new Map();
 const pendingPasswords = new Map();
 const smtpReady = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM);
+const resendReady = !!(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
+const brevoReady = !!(process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL && process.env.BREVO_FROM_NAME);
+const emailReady = brevoReady || resendReady || smtpReady;
 const mailer = smtpReady ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
 const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.svg':'image/svg+xml' };
 
@@ -31,7 +34,7 @@ async function route(req,res) {
     try {
       const input=['POST'].includes(req.method) ? await body(req) : {};
       if (url.pathname==='/api/register' && req.method==='POST') {
-        if (process.env.NODE_ENV === 'production' && !mailer) return send(res,503,{error:'Регистрация временно недоступна: владелец сайта ещё не настроил отправку почты.'});
+        if (process.env.NODE_ENV === 'production' && !emailReady) return send(res,503,{error:'Регистрация временно недоступна: владелец сайта ещё не настроил отправку почты.'});
         const email=String(input.email||'').trim().toLowerCase(), password=String(input.password||'');
         if(!emailOk(email)) return send(res,400,{error:'Введите корректный адрес почты.'});
         if(password.length<8 || password.length>128) return send(res,400,{error:'Пароль должен содержать от 8 до 128 символов.'});
@@ -40,7 +43,26 @@ async function route(req,res) {
         const codeHash=await scrypt(code, process.env.CODE_PEPPER||'fauna-violet-local',32);
         db.prepare('INSERT INTO verification_codes(email,code_hash,expires_at,attempts) VALUES(?,?,?,0) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0').run(email,codeHash,Date.now()+10*60*1000);
         const salt=randomBytes(16).toString('hex'); pendingPasswords.set(email,{salt,hash:(await scrypt(password,salt,64)).toString('hex'),until:Date.now()+10*60*1000});
-        if(mailer) { try { await mailer.sendMail({from:process.env.SMTP_FROM,to:email,subject:'Ваш код для Fauna Violet',text:`Код подтверждения: ${code}\nОн действует 10 минут.`,html:`<div style="font:16px Arial;color:#302341"><h2>Ваш код подтверждения</h2><p style="font-size:32px;letter-spacing:8px"><b>${code}</b></p><p>Код действует 10 минут.</p></div>`}); } catch (err) { console.error(`SMTP send failed: ${err.code || 'UNKNOWN'}${err.responseCode ? ` (${err.responseCode})` : ''}: ${err.message}`); db.prepare('DELETE FROM verification_codes WHERE email=?').run(email); pendingPasswords.delete(email); return send(res,502,{error:'Не удалось отправить письмо. Проверьте настройки почтового сервера и попробуйте снова.'}); } }
+        if(emailReady) {
+          const subject='Ваш код для Fauna Violet';
+          const textBody=`Код подтверждения: ${code}\nОн действует 10 минут.`;
+          const htmlBody=`<div style="font:16px Arial;color:#302341"><h2>Ваш код подтверждения</h2><p style="font-size:32px;letter-spacing:8px"><b>${code}</b></p><p>Код действует 10 минут.</p></div>`;
+          try {
+            if(brevoReady) {
+              const response=await fetch('https://api.brevo.com/v3/smtp/email',{method:'POST',headers:{'api-key':process.env.BREVO_API_KEY,'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({sender:{name:process.env.BREVO_FROM_NAME,email:process.env.BREVO_FROM_EMAIL},to:[{email}],subject,textContent:textBody,htmlContent:htmlBody}),signal:AbortSignal.timeout(15000)});
+              if(!response.ok) { const detail=(await response.text()).slice(0,1000); throw Error(`Brevo API HTTP ${response.status}: ${detail}`); }
+            } else if(resendReady) {
+              const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{'Authorization':`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({from:process.env.EMAIL_FROM,to:[email],subject,text:textBody,html:htmlBody}),signal:AbortSignal.timeout(15000)});
+              if(!response.ok) { const detail=(await response.text()).slice(0,1000); throw Error(`Resend API HTTP ${response.status}: ${detail}`); }
+            } else {
+              await mailer.sendMail({from:process.env.SMTP_FROM,to:email,subject,text:textBody,html:htmlBody});
+            }
+          } catch (err) {
+            console.error(`${brevoReady?'Brevo API':resendReady?'Resend API':'SMTP'} send failed: ${err.code || 'UNKNOWN'}${err.responseCode ? ` (${err.responseCode})` : ''}: ${err.message}`);
+            db.prepare('DELETE FROM verification_codes WHERE email=?').run(email); pendingPasswords.delete(email);
+            return send(res,502,{error:'Не удалось отправить письмо. Проверьте настройки почтового сервиса и попробуйте снова.'});
+          }
+        }
         return send(res,200,{message:`Код отправлен на ${email}.`,...(mailer?{}:{devCode:code})});
       }
       if(url.pathname==='/api/verify' && req.method==='POST') {
@@ -80,4 +102,4 @@ const animals=[
 {id:'otter',name:'Речная выдра',latin:'Lutra lutra',group:'Обитатели рек',emoji:'🦦',color:'#9ee5d1',fact:'Усы выдры улавливают движение воды и помогают находить рыбу даже в мутной реке.',habitat:'Чистые реки и озёра Европы и Азии с берегами, где можно устроить укрытие.',diet:'Рыба, ракообразные, лягушки и другие небольшие водные животные.',lifespan:'До 10 лет в природе',detail:'Выдра проводит много времени в воде, но отдыхает и выращивает детёнышей в норе на берегу. Чистые водоёмы и густая прибрежная растительность особенно важны для её жизни.'},
 {id:'panda',name:'Большая панда',latin:'Ailuropoda melanoleuca',group:'Жители гор',emoji:'🐼',color:'#d8c8ff',fact:'У панды есть увеличенная кость запястья — она работает как дополнительный «палец» для хватания бамбука.',habitat:'Горные бамбуковые леса центрального Китая.',diet:'Почти исключительно бамбук — до многих килограммов ежедневно.',lifespan:'15–20 лет в природе',detail:'Большая панда относится к хищным, но приспособилась питаться бамбуком. Чтобы получить достаточно энергии, она ест большую часть дня и выбирает разные части растения по сезону.'}
 ];
-const server=http.createServer(route); server.listen(Number(process.env.PORT||3000),'0.0.0.0',()=>console.log(`Fauna Violet: http://localhost:${process.env.PORT||3000} (${smtpReady?'SMTP email enabled':'development email mode'})`));
+const server=http.createServer(route); server.listen(Number(process.env.PORT||3000),'0.0.0.0',()=>console.log(`Fauna Violet: http://localhost:${process.env.PORT||3000} (${brevoReady?'Brevo API enabled':resendReady?'Resend API enabled':smtpReady?'SMTP email enabled':process.env.NODE_ENV==='production'?'email not configured':'development email mode'})`));
