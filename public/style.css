@@ -9,3 +9,24 @@
 .ambient{z-index:0;background:radial-gradient(ellipse at 18% 12%,#6f46a633,transparent 38%),radial-gradient(ellipse at 83% 66%,#376b7030,transparent 40%),#090a0c;background-size:160% 160%;animation:auroraShift 24s ease-in-out infinite alternate}.ambient span{opacity:.2;filter:blur(88px);animation:auroraFloat 17s ease-in-out infinite alternate}.ambient span:nth-child(1){top:8%;left:-17%;animation-duration:19s}.ambient span:nth-child(2){top:52%;right:-15%;animation-duration:23s;animation-delay:-7s}.ambient span:nth-child(3){width:35vw;height:35vw;top:7%;left:52%;animation-duration:21s;animation-delay:-12s}.ambient:after{content:"";position:absolute;inset:-15%;pointer-events:none;opacity:.14;background-image:radial-gradient(1px 1px at 12% 23%,#fff 45%,transparent 60%),radial-gradient(1px 1px at 71% 14%,#d8c8ff 45%,transparent 60%),radial-gradient(1.5px 1.5px at 43% 77%,#fff 45%,transparent 60%),radial-gradient(1px 1px at 86% 62%,#c7e8dd 45%,transparent 60%);background-size:240px 240px,310px 310px,370px 370px,280px 280px;animation:starsDrift 48s linear infinite}@keyframes auroraShift{0%{background-position:0% 0%}100%{background-position:100% 90%}}@keyframes auroraFloat{0%{transform:translate3d(-2vw,1vh,0) scale(.88)}100%{transform:translate3d(9vw,-6vh,0) scale(1.18)}}@keyframes starsDrift{to{transform:translate3d(-22px,35px,0)}}@media(prefers-reduced-motion:reduce){.ambient,.ambient span,.ambient:after{animation:none!important}}
 
 .ambient{z-index:-1}body{isolation:isolate}
+
+/* Updated atmospheric backgrounds and profile avatar */
+.hero-backdrop{background-image:linear-gradient(90deg,rgba(7,8,9,.88) 0%,rgba(7,8,9,.57) 45%,rgba(7,8,9,.16) 100%),linear-gradient(0deg,#090a0c 0%,transparent 32%),url('https://images.unsplash.com/photo-1728998888241-5b31364203a5?auto=format&fit=crop&w=2400&q=90');background-position:center,center,50% 44%;background-size:cover,cover,cover;animation:heroPan 34s cubic-bezier(.45,0,.55,1) infinite alternate;will-change:transform,background-position}
+@keyframes heroPan{0%{opacity:.96;transform:scale(1.015);background-position:center,center,50% 42%}100%{opacity:1;transform:scale(1.13);background-position:center,center,50% 58%}}
+.catalog{position:relative;isolation:isolate}
+.catalog::before{content:"";position:absolute;z-index:-1;pointer-events:none;inset:-80px -8vw 0;background:radial-gradient(ellipse at 14% 22%,rgba(105,56,172,.48),transparent 46%),radial-gradient(ellipse at 78% 44%,rgba(45,83,107,.25),transparent 48%),radial-gradient(ellipse at 57% 92%,rgba(87,46,134,.35),transparent 43%);background-size:160% 160%;filter:blur(32px);opacity:.82;animation:catalogAtmosphere 26s ease-in-out infinite alternate}
+@keyframes catalogAtmosphere{0%{background-position:0% 35%;transform:translate3d(-1%,0,0) scale(1)}100%{background-position:100% 65%;transform:translate3d(1%,1%,0) scale(1.04)}}
+.avatar{display:grid;place-items:center;overflow:hidden;padding:0;flex:none}
+.avatar img{display:block;width:100%;height:100%;object-fit:cover;border-radius:inherit}
+.avatar-picker{display:flex;align-items:center;gap:18px;margin:20px 0 22px;padding:16px;border:1px solid var(--line);border-radius:15px;background:#ffffff06}
+.avatar-preview{width:76px;height:76px;flex:none;display:grid;place-items:center;overflow:hidden;border:1px solid var(--violet);border-radius:50%;background:#251d31;color:var(--violet);font-size:27px;font-weight:800}
+.avatar-preview img{width:100%;height:100%;object-fit:cover}
+.avatar-picker-controls{min-width:0;display:grid;gap:8px}
+.avatar-picker-controls label{font-weight:700;font-size:15px}
+.avatar-picker-controls input[type=file]{width:100%;height:auto!important;padding:0!important;border:0!important;background:transparent!important;color:var(--muted);font-size:14px!important}
+.avatar-picker-controls input[type=file]::file-selector-button{margin-right:10px;padding:9px 12px;border:1px solid #ffffff30;border-radius:9px;background:#201d27;color:var(--text);cursor:pointer}
+.avatar-picker-controls small{color:var(--muted);font-size:13px;line-height:1.4}
+.avatar-remove{justify-self:start;padding:0;border:0;background:none;color:#d8b9ff;font:inherit;font-size:14px;cursor:pointer}
+.avatar-remove:hover{text-decoration:underline}
+@media(max-width:600px){.hero-backdrop{background-image:linear-gradient(90deg,#08090bea,#08090b88 72%,#08090b55),linear-gradient(0deg,#090a0c,transparent 45%),url('https://images.unsplash.com/photo-1728998888241-5b31364203a5?auto=format&fit=crop&w=1400&q=84');background-position:center,center,50% 44%;background-size:cover,cover,cover}.avatar-picker{align-items:flex-start;gap:14px;padding:13px}.avatar-preview{width:64px;height:64px}}
+@media(prefers-reduced-motion:reduce){.hero-backdrop,.catalog::before{animation:none!important;transform:none!important}}
