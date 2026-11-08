@@ -14,11 +14,15 @@ mkdirSync(dataDir, { recursive: true });
 const db = new DatabaseSync(resolve(dataDir, 'fauna.db'));
 db.exec(`PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);`);
+CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS support_messages (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, sender TEXT NOT NULL CHECK(sender IN ('user','admin')), message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, read_by_admin INTEGER NOT NULL DEFAULT 0);`);
 const sessions = new Map();
 const adminSessions = new Map();
 const adminFailures = new Map();
 const pendingPasswords = new Map();
+const taxaCache = new Map();
+const chatRateLimits = new Map();
+let taxaQueue = Promise.resolve(), taxaLastRequest = 0;
 const smtpReady = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM);
 const resendReady = !!(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
 const brevoReady = !!(process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL && process.env.BREVO_FROM_NAME);
@@ -33,6 +37,7 @@ function sessionUser(req) { const raw=(req.headers.cookie||'').split(';').map(x=
 function adminToken(req) { return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_admin='))?.slice('fauna_admin='.length); }
 function isAdmin(req) { const token=adminToken(req), expires=token&&adminSessions.get(token); if(!expires)return false; if(expires<Date.now()){adminSessions.delete(token);return false} adminSessions.set(token,Date.now()+60*60*1000); return true; }
 function fixedEqual(a,b) { return timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest()); }
+async function fetchTaxa(url,options) { const waitFor=taxaQueue;let release;taxaQueue=new Promise(resolve=>release=resolve);await waitFor;const delay=Math.max(0,1000-(Date.now()-taxaLastRequest));if(delay)await new Promise(resolve=>setTimeout(resolve,delay));taxaLastRequest=Date.now();try{return await fetch(url,options)}finally{release()} }
 async function sendEmail(to,subject,textBody,htmlBody) {
   if(brevoReady) {
     const response=await fetch('https://api.brevo.com/v3/smtp/email',{method:'POST',headers:{'api-key':process.env.BREVO_API_KEY,'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({sender:{name:process.env.BREVO_FROM_NAME,email:process.env.BREVO_FROM_EMAIL},to:[{email:to}],subject,textContent:textBody,htmlContent:htmlBody}),signal:AbortSignal.timeout(15000)});
@@ -68,6 +73,73 @@ async function route(req,res) {
         const rows=db.prepare('SELECT id,email,verified,created_at FROM users ORDER BY id DESC').all();
         const summary=db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified FROM users').get();
         return send(res,200,{users:rows,summary:{total:summary.total,verified:summary.verified||0}});
+      }
+      if(url.pathname==='/api/admin/support' && req.method==='GET') {
+        if(!isAdmin(req)) return send(res,401,{error:'Требуется вход администратора.'});
+        const threads=db.prepare(`SELECT u.id AS user_id,u.email,MAX(m.created_at) AS last_message,COUNT(m.id) AS message_count,SUM(CASE WHEN m.sender='user' AND m.read_by_admin=0 THEN 1 ELSE 0 END) AS unread FROM users u JOIN support_messages m ON m.user_id=u.id GROUP BY u.id ORDER BY MAX(m.id) DESC`).all();
+        return send(res,200,{threads});
+      }
+      const adminThread=url.pathname.match(/^\/api\/admin\/support\/(\d+)$/);
+      if(adminThread && req.method==='GET') {
+        if(!isAdmin(req)) return send(res,401,{error:'Требуется вход администратора.'});
+        const userId=Number(adminThread[1]), account=db.prepare('SELECT id,email FROM users WHERE id=?').get(userId);
+        if(!account)return send(res,404,{error:'Пользователь не найден.'});
+        db.prepare("UPDATE support_messages SET read_by_admin=1 WHERE user_id=? AND sender='user'").run(userId);
+        const messages=db.prepare('SELECT id,sender,message,created_at FROM support_messages WHERE user_id=? ORDER BY id').all(userId);
+        return send(res,200,{account,messages});
+      }
+      const adminReply=url.pathname.match(/^\/api\/admin\/support\/(\d+)\/reply$/);
+      if(adminReply && req.method==='POST') {
+        if(!isAdmin(req))return send(res,401,{error:'Требуется вход администратора.'});
+        const userId=Number(adminReply[1]), message=String(input.message||'').trim();
+        if(!db.prepare('SELECT id FROM users WHERE id=?').get(userId))return send(res,404,{error:'Пользователь не найден.'});
+        if(!message||message.length>3000)return send(res,400,{error:'Ответ должен содержать от 1 до 3000 символов.'});
+        db.prepare("INSERT INTO support_messages(user_id,sender,message,read_by_admin) VALUES(?,'admin',?,1)").run(userId,message);
+        return send(res,200,{ok:true});
+      }
+      if(url.pathname==='/api/support/messages' && req.method==='GET') {
+        const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Войдите, чтобы написать в поддержку.'});
+        return send(res,200,{messages:db.prepare('SELECT id,sender,message,created_at FROM support_messages WHERE user_id=? ORDER BY id DESC LIMIT 100').all(account.id).reverse()});
+      }
+      if(url.pathname==='/api/support/messages' && req.method==='POST') {
+        const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Войдите, чтобы написать в поддержку.'});
+        const message=String(input.message||'').trim();if(!message||message.length>3000)return send(res,400,{error:'Сообщение должно содержать от 1 до 3000 символов.'});
+        const recent=db.prepare("SELECT COUNT(*) AS total FROM support_messages WHERE user_id=? AND sender='user' AND created_at>=datetime('now','-1 minute')").get(account.id);
+        if(recent.total>=5)return send(res,429,{error:'Слишком много сообщений подряд. Подожди минуту и попробуй снова.'});
+        const result=db.prepare("INSERT INTO support_messages(user_id,sender,message) VALUES(?,'user',?)").run(account.id,message);
+        return send(res,201,{message:db.prepare('SELECT id,sender,message,created_at FROM support_messages WHERE id=?').get(result.lastInsertRowid)});
+      }
+      if(url.pathname==='/api/chat' && req.method==='POST') {
+        const key=String(process.env.GEMINI_API_KEY||''), question=String(input.message||'').trim();
+        if(!key)return send(res,503,{error:'AI-помощник пока не подключён: владельцу сайта нужно добавить GEMINI_API_KEY в Railway Variables.'});
+        if(!question||question.length>1200)return send(res,400,{error:'Напишите вопрос длиной до 1200 символов.'});
+        const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',').at(-1).trim(), now=Date.now(), prev=chatRateLimits.get(ip);
+        if(prev&&prev.until>now&&prev.count>=12)return send(res,429,{error:'Слишком много вопросов подряд. Попробуйте через минуту.'});
+        const state=prev&&prev.until>now?prev:{count:0,until:now+60_000};state.count++;chatRateLimits.set(ip,state);
+        const history=Array.isArray(input.history)?input.history.slice(-8).map(m=>({role:m?.role==='model'?'model':'user',parts:[{text:String(m?.text||'').slice(0,1200)}]})).filter(m=>m.parts[0].text):[];
+        const model=String(process.env.GEMINI_MODEL||'gemini-3.8-flash');
+        try {
+          const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:JSON.stringify({systemInstruction:{parts:[{text:'Ты дружелюбный русскоязычный помощник сайта Fauna Violet. Отвечай понятно и доброжелательно, преимущественно о животных, природе и использовании сайта. Не выдумывай факты: если не уверен, прямо скажи об этом и предложи проверить надёжный источник. Не проси пароли, коды подтверждения или платёжные данные. Ответ до 180 слов.'}]},contents:[...history,{role:'user',parts:[{text:question}]}],generationConfig:{temperature:0.55,maxOutputTokens:700}}),signal:AbortSignal.timeout(25000)});
+          const data=await response.json();if(!response.ok){console.error(`Gemini API failed: HTTP ${response.status}`);return send(res,response.status===429?429:502,{error:response.status===429?'У AI временно закончился лимит запросов. Попробуйте позже.':'AI сейчас не смог ответить. Попробуйте ещё раз.'});}
+          const answer=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim();if(!answer)return send(res,502,{error:'AI прислал пустой ответ. Попробуйте ещё раз.'});
+          return send(res,200,{answer});
+        } catch(err) { console.error(`Gemini request failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось связаться с AI. Попробуйте ещё раз.'}); }
+      }
+      if(url.pathname==='/api/animals/search' && req.method==='GET') {
+        const q=String(url.searchParams.get('q')||'').trim().slice(0,100);
+        if(q.length<2)return send(res,200,{animals:[]});
+        const cacheKey=q.toLocaleLowerCase('ru');let results=taxaCache.get(cacheKey);
+        if(!results||results.until<Date.now()) {
+          const apiUrl=new URL('https://api.inaturalist.org/v1/taxa/autocomplete');apiUrl.searchParams.set('q',q);apiUrl.searchParams.set('per_page','20');apiUrl.searchParams.set('locale','ru');apiUrl.searchParams.set('taxon_id','2');
+          try { const response=await fetchTaxa(apiUrl,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(12000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json();results=(data.results||[]).filter(t=>t.is_active&&['species','subspecies'].includes(t.rank)).map(t=>{const icons={Mammalia:'🐾',Aves:'🐦',Amphibia:'🐸',Reptilia:'🦎',Actinopterygii:'🐟',Insecta:'🦋',Arachnida:'🕷️',Mollusca:'🐙',Annelida:'🪱',Chromista:'🪸'};return {id:`inat-${t.id}`,taxonId:t.id,name:t.preferred_common_name||t.name,latin:t.name,group:'Онлайн-каталог',emoji:icons[t.iconic_taxon_name]||'🐾',color:'#65537f',image:null,observationsCount:t.observations_count,rank:t.rank,sourceUrl:`https://www.inaturalist.org/taxa/${t.id}`,detail:`Вид из международного каталога iNaturalist. На платформе зарегистрировано наблюдений: ${Number(t.observations_count||0).toLocaleString('ru-RU')}.`};});taxaCache.set(cacheKey,{until:Date.now()+10*60*1000,results});if(taxaCache.size>150)taxaCache.delete(taxaCache.keys().next().value); }
+          catch(err) { console.error(`iNaturalist search failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось выполнить поиск по каталогу видов. Попробуйте позже.'}); }
+        }
+        return send(res,200,{animals:results,source:'iNaturalist'});
+      }
+      if(url.pathname==='/api/animals/detail' && req.method==='GET') {
+        const id=Number(url.searchParams.get('id'));if(!Number.isSafeInteger(id)||id<1)return send(res,400,{error:'Некорректный ID вида.'});
+        try { const response=await fetchTaxa(`https://api.inaturalist.org/v1/taxa/${id}?locale=ru`,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json(),taxon=data.results?.[0];if(!taxon)return send(res,404,{error:'Описание этого вида не найдено.'});const detail=String(taxon.wikipedia_summary||'').replace(/<[^>]*>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\s+/g,' ').trim();return send(res,200,{detail:detail||`${taxon.preferred_common_name||taxon.name} — таксон из каталога iNaturalist. Подробная статья может отсутствовать на русском языке.`,habitat:'Уточняйте по научным источникам для конкретного подвида и региона.',diet:'Рацион зависит от конкретного вида.',lifespan:'Продолжительность жизни зависит от конкретного вида.',sourceUrl:`https://www.inaturalist.org/taxa/${id}`,sourceName:'iNaturalist'}); }
+        catch(err) { console.error(`iNaturalist detail failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось загрузить описание вида. Попробуйте позже.'}); }
       }
       if(url.pathname==='/api/forgot' && req.method==='POST') {
         const email=String(input.email||'').trim().toLowerCase();
@@ -154,7 +226,7 @@ async function route(req,res) {
       }
       if(url.pathname==='/api/me' && req.method==='GET') { const u=sessionUser(req); return send(res,200,{user:u?.verified?{email:u.email}:null}); }
       if(url.pathname==='/api/logout' && req.method==='POST') { const token=(req.headers.cookie||'').match(/(?:^|;\s*)fauna_session=([^;]+)/)?.[1]; if(token) sessions.delete(token); return send(res,200,{ok:true},'fauna_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); }
-      if(url.pathname==='/api/animals' && req.method==='GET') { const u=sessionUser(req); if(!u?.verified) return send(res,401,{error:'Войдите, чтобы открыть полный путеводитель.'}); return send(res,200,{animals:animals}); }
+      if(url.pathname==='/api/animals' && req.method==='GET') return send(res,200,{animals:animals});
       return send(res,404,{error:'Не найдено.'});
     } catch(e) { console.error(e); return send(res,500,{error:'Что-то пошло не так. Попробуйте ещё раз.'}); }
   }
