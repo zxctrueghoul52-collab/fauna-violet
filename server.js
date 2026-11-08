@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash
 const sessions = new Map();
 const pendingPasswords = new Map();
 const smtpReady = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM);
-const mailer = smtpReady ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
+const mailer = smtpReady ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
 const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.svg':'image/svg+xml' };
 
 function send(res, status, data, cookie='') { res.writeHead(status, { 'content-type':'application/json; charset=utf-8', 'set-cookie': cookie, 'cache-control':'no-store' }); res.end(JSON.stringify(data)); }
@@ -40,7 +40,7 @@ async function route(req,res) {
         const codeHash=await scrypt(code, process.env.CODE_PEPPER||'fauna-violet-local',32);
         db.prepare('INSERT INTO verification_codes(email,code_hash,expires_at,attempts) VALUES(?,?,?,0) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0').run(email,codeHash,Date.now()+10*60*1000);
         const salt=randomBytes(16).toString('hex'); pendingPasswords.set(email,{salt,hash:(await scrypt(password,salt,64)).toString('hex'),until:Date.now()+10*60*1000});
-        if(mailer) { try { await mailer.sendMail({from:process.env.SMTP_FROM,to:email,subject:'Ваш код для Fauna Violet',text:`Код подтверждения: ${code}\nОн действует 10 минут.`,html:`<div style="font:16px Arial;color:#302341"><h2>Ваш код подтверждения</h2><p style="font-size:32px;letter-spacing:8px"><b>${code}</b></p><p>Код действует 10 минут.</p></div>`}); } catch { db.prepare('DELETE FROM verification_codes WHERE email=?').run(email); pendingPasswords.delete(email); return send(res,502,{error:'Не удалось отправить письмо. Проверьте настройки почтового сервера и попробуйте снова.'}); } }
+        if(mailer) { try { await mailer.sendMail({from:process.env.SMTP_FROM,to:email,subject:'Ваш код для Fauna Violet',text:`Код подтверждения: ${code}\nОн действует 10 минут.`,html:`<div style="font:16px Arial;color:#302341"><h2>Ваш код подтверждения</h2><p style="font-size:32px;letter-spacing:8px"><b>${code}</b></p><p>Код действует 10 минут.</p></div>`}); } catch (err) { console.error(`SMTP send failed: ${err.code || 'UNKNOWN'}${err.responseCode ? ` (${err.responseCode})` : ''}: ${err.message}`); db.prepare('DELETE FROM verification_codes WHERE email=?').run(email); pendingPasswords.delete(email); return send(res,502,{error:'Не удалось отправить письмо. Проверьте настройки почтового сервера и попробуйте снова.'}); } }
         return send(res,200,{message:`Код отправлен на ${email}.`,...(mailer?{}:{devCode:code})});
       }
       if(url.pathname==='/api/verify' && req.method==='POST') {
