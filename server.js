@@ -109,53 +109,20 @@ async function route(req,res) {
         const result=db.prepare("INSERT INTO support_messages(user_id,sender,message) VALUES(?,'user',?)").run(account.id,message);
         return send(res,201,{message:db.prepare('SELECT id,sender,message,created_at FROM support_messages WHERE id=?').get(result.lastInsertRowid)});
       }
-      if(url.pathname==='/api/chat' && req.method==='POST') {
-        const key=String(process.env.GEMINI_API_KEY||''), question=String(input.message||'').trim();
-        if(!key)return send(res,503,{error:'AI-помощник пока не подключён: владельцу сайта нужно добавить GEMINI_API_KEY в Railway Variables.'});
-        if(!question||question.length>1200)return send(res,400,{error:'Напишите вопрос длиной до 1200 символов.'});
-        const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',').at(-1).trim(), now=Date.now(), prev=chatRateLimits.get(ip);
-        if(prev&&prev.until>now&&prev.count>=12)return send(res,429,{error:'Слишком много вопросов подряд. Попробуйте через минуту.'});
-        const state=prev&&prev.until>now?prev:{count:0,until:now+60_000};state.count++;chatRateLimits.set(ip,state);
-        const history=Array.isArray(input.history)?input.history.slice(-8).map(m=>({role:m?.role==='model'?'model':'user',parts:[{text:String(m?.text||'').slice(0,1200)}]})).filter(m=>m.parts[0].text):[];
-        const model=String(process.env.GEMINI_MODEL||'gemini-3.8-flash');
-        const requestBody=JSON.stringify({systemInstruction:{parts:[{text:'Ты дружелюбный русскоязычный помощник сайта Fauna Violet. Отвечай понятно и доброжелательно, преимущественно о животных, природе и использовании сайта. Не выдумывай факты: если не уверен, прямо скажи об этом и предложи проверить надёжный источник. Не проси пароли, коды подтверждения или платёжные данные. Ответ до 180 слов.'}]},contents:[...history,{role:'user',parts:[{text:question}]}],generationConfig:{temperature:0.55,maxOutputTokens:700}});
-        let lastError=null;
-        for(let attempt=0;attempt<2;attempt++) {
-          try {
-            const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:requestBody,signal:AbortSignal.timeout(45000)});
-            const data=await response.json();
-            if(!response.ok) {
-              const apiErrorStatus=String(data.error?.status||'UNKNOWN').slice(0,80);
-              const apiErrorMessage=String(data.error?.message||'No error message returned').replace(/[\r\n\t]+/g,' ').slice(0,300);
-              console.error(`Gemini API failed: HTTP ${response.status} ${apiErrorStatus}: ${apiErrorMessage}`);
-              if((response.status===503||response.status===500)&&attempt===0){await new Promise(resolve=>setTimeout(resolve,1500));continue;}
-              return send(res,response.status===429?429:502,{error:response.status===429?'У AI временно закончился лимит запросов. Попробуйте позже.':'AI сейчас не смог ответить. Попробуйте ещё раз.'});
-            }
-            const answer=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim();if(!answer)return send(res,502,{error:'AI прислал пустой ответ. Попробуйте ещё раз.'});
-            return send(res,200,{answer});
-          } catch(err) {
-            lastError=err;
-            if(attempt===0&&(err.name==='TimeoutError'||err.name==='AbortError')){await new Promise(resolve=>setTimeout(resolve,1500));continue;}
-            break;
-          }
-        }
-        console.error(`Gemini request failed: ${lastError?.name||'Error'}`);
-        return send(res,502,{error:lastError?.name==='TimeoutError'||lastError?.name==='AbortError'?'Gemini долго не отвечает. Попробуйте ещё раз чуть позже.':'Не удалось связаться с AI. Попробуйте ещё раз.'});
-      }
       if(url.pathname==='/api/animals/search' && req.method==='GET') {
         const q=String(url.searchParams.get('q')||'').trim().slice(0,100);
         if(q.length<2)return send(res,200,{animals:[]});
         const cacheKey=q.toLocaleLowerCase('ru');let results=taxaCache.get(cacheKey);
         if(!results||results.until<Date.now()) {
           const apiUrl=new URL('https://api.inaturalist.org/v1/taxa/autocomplete');apiUrl.searchParams.set('q',q);apiUrl.searchParams.set('per_page','20');apiUrl.searchParams.set('locale','ru');apiUrl.searchParams.set('taxon_id','2');
-          try { const response=await fetchTaxa(apiUrl,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(12000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json();results=(data.results||[]).filter(t=>t.is_active&&['species','subspecies'].includes(t.rank)).map(t=>{const icons={Mammalia:'🐾',Aves:'🐦',Amphibia:'🐸',Reptilia:'🦎',Actinopterygii:'🐟',Insecta:'🦋',Arachnida:'🕷️',Mollusca:'🐙',Annelida:'🪱',Chromista:'🪸'};return {id:`inat-${t.id}`,taxonId:t.id,name:t.preferred_common_name||t.name,latin:t.name,group:'Онлайн-каталог',emoji:icons[t.iconic_taxon_name]||'🐾',color:'#65537f',image:null,observationsCount:t.observations_count,rank:t.rank,sourceUrl:`https://www.inaturalist.org/taxa/${t.id}`,detail:`Вид из международного каталога iNaturalist. На платформе зарегистрировано наблюдений: ${Number(t.observations_count||0).toLocaleString('ru-RU')}.`};});taxaCache.set(cacheKey,{until:Date.now()+10*60*1000,results});if(taxaCache.size>150)taxaCache.delete(taxaCache.keys().next().value); }
+          try { const response=await fetchTaxa(apiUrl,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(12000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json();results=(data.results||[]).filter(t=>t.is_active&&['species','subspecies'].includes(t.rank)&&(t.default_photo?.medium_url||t.default_photo?.square_url)).map(t=>{const icons={Mammalia:'🐾',Aves:'🐦',Amphibia:'🐸',Reptilia:'🦎',Actinopterygii:'🐟',Insecta:'🦋',Arachnida:'🕷️',Mollusca:'🐙',Annelida:'🪱',Chromista:'🪸'};return {id:`inat-${t.id}`,taxonId:t.id,name:t.preferred_common_name||t.name,latin:t.name,group:'Онлайн-каталог',emoji:icons[t.iconic_taxon_name]||'🐾',color:'#65537f',image:t.default_photo?.medium_url||t.default_photo?.square_url,observationsCount:t.observations_count,rank:t.rank,sourceUrl:`https://www.inaturalist.org/taxa/${t.id}`,detail:`Вид из международного каталога iNaturalist. На платформе зарегистрировано наблюдений: ${Number(t.observations_count||0).toLocaleString('ru-RU')}.`};});taxaCache.set(cacheKey,{until:Date.now()+10*60*1000,results});if(taxaCache.size>150)taxaCache.delete(taxaCache.keys().next().value); }
           catch(err) { console.error(`iNaturalist search failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось выполнить поиск по каталогу видов. Попробуйте позже.'}); }
         }
         return send(res,200,{animals:results,source:'iNaturalist'});
       }
       if(url.pathname==='/api/animals/detail' && req.method==='GET') {
         const id=Number(url.searchParams.get('id'));if(!Number.isSafeInteger(id)||id<1)return send(res,400,{error:'Некорректный ID вида.'});
-        try { const response=await fetchTaxa(`https://api.inaturalist.org/v1/taxa/${id}?locale=ru`,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json(),taxon=data.results?.[0];if(!taxon)return send(res,404,{error:'Описание этого вида не найдено.'});const detail=String(taxon.wikipedia_summary||'').replace(/<[^>]*>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\s+/g,' ').trim();return send(res,200,{detail:detail||`${taxon.preferred_common_name||taxon.name} — таксон из каталога iNaturalist. Подробная статья может отсутствовать на русском языке.`,habitat:'Уточняйте по научным источникам для конкретного подвида и региона.',diet:'Рацион зависит от конкретного вида.',lifespan:'Продолжительность жизни зависит от конкретного вида.',sourceUrl:`https://www.inaturalist.org/taxa/${id}`,sourceName:'iNaturalist'}); }
+        try { const response=await fetchTaxa(`https://api.inaturalist.org/v1/taxa/${id}?locale=ru`,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json(),taxon=data.results?.[0];if(!taxon)return send(res,404,{error:'Описание этого вида не найдено.'});const detail=String(taxon.wikipedia_summary||'').replace(/<[^>]*>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\s+/g,' ').trim();return send(res,200,{detail:detail||`${taxon.preferred_common_name||taxon.name} — таксон из каталога iNaturalist. Подробная статья может отсутствовать на русском языке.`,habitat:'Уточняйте по научным источникам для конкретного подвида и региона.',diet:'Рацион зависит от конкретного вида.',lifespan:'Продолжительность жизни зависит от конкретного вида.',sourceUrl:`https://www.inaturalist.org/taxa/${id}`,image:taxon.default_photo?.medium_url||taxon.default_photo?.square_url||null,sourceName:'iNaturalist'}); }
         catch(err) { console.error(`iNaturalist detail failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось загрузить описание вида. Попробуйте позже.'}); }
       }
       if(url.pathname==='/api/forgot' && req.method==='POST') {
@@ -243,12 +210,12 @@ async function route(req,res) {
       }
       if(url.pathname==='/api/me' && req.method==='GET') { const u=sessionUser(req); return send(res,200,{user:u?.verified?{email:u.email}:null}); }
       if(url.pathname==='/api/logout' && req.method==='POST') { const token=(req.headers.cookie||'').match(/(?:^|;\s*)fauna_session=([^;]+)/)?.[1]; if(token) sessions.delete(token); return send(res,200,{ok:true},'fauna_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); }
-      if(url.pathname==='/api/animals' && req.method==='GET') return send(res,200,{animals:animals});
+      if(url.pathname==='/api/animals' && req.method==='GET') return send(res,200,{animals:animals.map(a=>({...a,image:animalPhotos[a.id]}))});
       return send(res,404,{error:'Не найдено.'});
     } catch(e) { console.error(e); return send(res,500,{error:'Что-то пошло не так. Попробуйте ещё раз.'}); }
   }
   if(url.pathname==='/admin' || url.pathname==='/admin/') {
-    try { const data=await readFile(resolve(root,'public','admin.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'no-referrer','x-robots-tag':'noindex, nofollow','content-security-policy':"default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"});return res.end(data); }
+    try { const data=await readFile(resolve(root,'public','admin.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'no-referrer','x-robots-tag':'noindex, nofollow','content-security-policy':"default-src 'self'; style-src 'self'; font-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"});return res.end(data); }
     catch { res.writeHead(404);return res.end('Not found'); }
   }
   const path=url.pathname==='/'?'/index.html':url.pathname;
@@ -281,4 +248,12 @@ const animals=[
 {id:'hummingbird',name:'Колибри',latin:'Trochilidae',group:'Лес',emoji:'🐦',color:'#4d8b77',fact:'Колибри может зависать у цветка, быстро взмахивая крыльями.',habitat:'Леса, горы и сады Америки.',diet:'Нектар цветов и мелкие насекомые.',lifespan:'В среднем 3–5 лет',detail:'Колибри — крошечные птицы с очень быстрыми крыльями. Они умеют зависать в воздухе и летать назад, пока собирают нектар длинным языком. Высокая активность требует большого количества энергии, поэтому колибри регулярно посещают множество цветов. Пыльца переносится вместе с птицей, делая её важным участником опыления растений.'},
 {id:'turtle',name:'Зелёная морская черепаха',latin:'Chelonia mydas',group:'Океан',emoji:'🐢',color:'#4f8171',fact:'Самки возвращаются откладывать яйца на пляжи, где сами появились на свет.',habitat:'Тропические и субтропические океаны; гнездовые пляжи.',diet:'Молодые едят разнообразную пищу, взрослые часто питаются морскими травами.',lifespan:'Может жить более 60 лет',detail:'Зелёная морская черепаха мигрирует между местами кормления и пляжами, где откладывает яйца. Взрослые особи часто пасутся на подводных лугах морской травы, помогая поддерживать здоровье прибрежных экосистем. Черепашата вылупляются ночью и самостоятельно направляются к морю. Световое загрязнение пляжей может сбить их с пути, поэтому тёмные участки побережья особенно важны.'}
 ];
+const animalPhotos={
+  fox:'https://static.inaturalist.org/photos/265916780/medium.jpg',owl:'https://inaturalist-open-data.s3.amazonaws.com/photos/150549757/medium.jpg',otter:'https://inaturalist-open-data.s3.amazonaws.com/photos/100389336/medium.jpg',panda:'https://inaturalist-open-data.s3.amazonaws.com/photos/150277588/medium.jpg',
+  'snow-leopard':'https://inaturalist-open-data.s3.amazonaws.com/photos/16308659/medium.jpg',wolf:'https://inaturalist-open-data.s3.amazonaws.com/photos/43410580/medium.jpg',elephant:'https://inaturalist-open-data.s3.amazonaws.com/photos/93674728/medium.jpg',tiger:'https://inaturalist-open-data.s3.amazonaws.com/photos/65783557/medium.jpg',
+  'red-panda':'https://inaturalist-open-data.s3.amazonaws.com/photos/26989188/medium.jpeg','polar-bear':'https://inaturalist-open-data.s3.amazonaws.com/photos/102785980/medium.jpg',orca:'https://inaturalist-open-data.s3.amazonaws.com/photos/223550594/medium.jpg','blue-whale':'https://static.inaturalist.org/photos/194385336/medium.jpg',
+  monarch:'https://inaturalist-open-data.s3.amazonaws.com/photos/227923335/medium.jpeg',capybara:'https://inaturalist-open-data.s3.amazonaws.com/photos/91546944/medium.jpg',fennec:'https://inaturalist-open-data.s3.amazonaws.com/photos/178694522/medium.jpeg',octopus:'https://inaturalist-open-data.s3.amazonaws.com/photos/166419253/medium.jpeg',
+  axolotl:'https://inaturalist-open-data.s3.amazonaws.com/photos/87949947/medium.jpg',penguin:'https://inaturalist-open-data.s3.amazonaws.com/photos/7229/medium.jpg',jaguar:'https://static.inaturalist.org/photos/51015966/medium.jpg',sloth:'https://static.inaturalist.org/photos/73892662/medium.jpg',
+  giraffe:'https://static.inaturalist.org/photos/308239525/medium.jpg',lynx:'https://inaturalist-open-data.s3.amazonaws.com/photos/186702089/medium.jpeg',hummingbird:'https://inaturalist-open-data.s3.amazonaws.com/photos/12739525/medium.jpg',turtle:'https://inaturalist-open-data.s3.amazonaws.com/photos/197457958/medium.jpg'
+};
 const server=http.createServer(route); server.listen(Number(process.env.PORT||3000),'0.0.0.0',()=>console.log(`Fauna Violet: http://localhost:${process.env.PORT||3000} (${brevoReady?'Brevo API enabled':resendReady?'Resend API enabled':smtpReady?'SMTP email enabled':process.env.NODE_ENV==='production'?'email not configured':'development email mode'})`));
