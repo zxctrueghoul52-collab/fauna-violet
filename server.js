@@ -151,9 +151,10 @@ async function route(req,res) {
         return send(res,201,{message:db.prepare('SELECT id,sender,message,created_at FROM support_messages WHERE id=?').get(result.lastInsertRowid)});
       }
       if(url.pathname==='/api/animals/search' && req.method==='GET') {
+        const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Создайте аккаунт и войдите, чтобы искать животных.'});
         const q=String(url.searchParams.get('q')||'').trim().slice(0,100);
         if(q.length<2)return send(res,200,{animals:[]});
-        const account=sessionUser(req),subject=searchSubject(req,account),month=currentMonth(),plan=effectivePlan(account),limit=PLANS[plan].monthlySearchLimit,used=db.prepare('SELECT used FROM animal_search_usage WHERE subject=? AND month=?').get(subject,month)?.used||0;
+        const subject=searchSubject(req,account),month=currentMonth(),plan=effectivePlan(account),limit=PLANS[plan].monthlySearchLimit,used=db.prepare('SELECT used FROM animal_search_usage WHERE subject=? AND month=?').get(subject,month)?.used||0;
         if(used>=limit)return send(res,429,{error:`Лимит поиска на тарифе ${PLANS[plan].name} исчерпан (${limit} поисков в месяц). Перейдите на Pro или Ultra.`,plan,used,limit});
         const cacheKey=q.toLocaleLowerCase('ru');let results=taxaCache.get(cacheKey);
         if(!results||results.until<Date.now()) {
@@ -165,6 +166,7 @@ async function route(req,res) {
         return send(res,200,{animals:results,source:'iNaturalist',searchesUsed:used+1,searchLimit:limit,plan});
       }
       if(url.pathname==='/api/animals/detail' && req.method==='GET') {
+        const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Войдите, чтобы читать описание животных.'});
         const id=Number(url.searchParams.get('id'));if(!Number.isSafeInteger(id)||id<1)return send(res,400,{error:'Некорректный ID вида.'});
         try { const response=await fetchTaxa(`https://api.inaturalist.org/v1/taxa/${id}?locale=ru`,{headers:{'Accept':'application/json','User-Agent':'FaunaViolet/1.0'},signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error(`iNaturalist HTTP ${response.status}`);const data=await response.json(),taxon=data.results?.[0];if(!taxon)return send(res,404,{error:'Описание этого вида не найдено.'});const detail=String(taxon.wikipedia_summary||'').replace(/<[^>]*>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\s+/g,' ').trim();return send(res,200,{detail:detail||`${taxon.preferred_common_name||taxon.name} — таксон из каталога iNaturalist. Подробная статья может отсутствовать на русском языке.`,habitat:'Уточняйте по научным источникам для конкретного подвида и региона.',diet:'Рацион зависит от конкретного вида.',lifespan:'Продолжительность жизни зависит от конкретного вида.',sourceUrl:`https://www.inaturalist.org/taxa/${id}`,image:taxon.default_photo?.medium_url||taxon.default_photo?.square_url||null,sourceName:'iNaturalist'}); }
         catch(err) { console.error(`iNaturalist detail failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось загрузить описание вида. Попробуйте позже.'}); }
@@ -255,7 +257,7 @@ async function route(req,res) {
       }
       if(url.pathname==='/api/me' && req.method==='GET') { const u=sessionUser(req); return send(res,200,{user:u?.verified?{email:u.email}:null}); }
       if(url.pathname==='/api/logout' && req.method==='POST') { const token=(req.headers.cookie||'').match(/(?:^|;\s*)fauna_session=([^;]+)/)?.[1]; if(token) sessions.delete(token); return send(res,200,{ok:true},'fauna_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); }
-      if(url.pathname==='/api/animals' && req.method==='GET') return send(res,200,{animals:animals.map(a=>({...a,image:animalPhotos[a.id]}))});
+      if(url.pathname==='/api/animals' && req.method==='GET') { const account=sessionUser(req);if(!account?.verified)return send(res,401,{error:'Войдите, чтобы открыть каталог животных.'});return send(res,200,{animals:animals.map(a=>({...a,image:animalPhotos[a.id]}))}); }
       return send(res,404,{error:'Не найдено.'});
     } catch(e) { console.error(e); return send(res,500,{error:'Что-то пошло не так. Попробуйте ещё раз.'}); }
   }
