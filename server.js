@@ -118,12 +118,27 @@ async function route(req,res) {
         const state=prev&&prev.until>now?prev:{count:0,until:now+60_000};state.count++;chatRateLimits.set(ip,state);
         const history=Array.isArray(input.history)?input.history.slice(-8).map(m=>({role:m?.role==='model'?'model':'user',parts:[{text:String(m?.text||'').slice(0,1200)}]})).filter(m=>m.parts[0].text):[];
         const model=String(process.env.GEMINI_MODEL||'gemini-3.8-flash');
-        try {
-          const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:JSON.stringify({systemInstruction:{parts:[{text:'Ты дружелюбный русскоязычный помощник сайта Fauna Violet. Отвечай понятно и доброжелательно, преимущественно о животных, природе и использовании сайта. Не выдумывай факты: если не уверен, прямо скажи об этом и предложи проверить надёжный источник. Не проси пароли, коды подтверждения или платёжные данные. Ответ до 180 слов.'}]},contents:[...history,{role:'user',parts:[{text:question}]}],generationConfig:{temperature:0.55,maxOutputTokens:700}}),signal:AbortSignal.timeout(25000)});
-          const data=await response.json();if(!response.ok){console.error(`Gemini API failed: HTTP ${response.status}`);return send(res,response.status===429?429:502,{error:response.status===429?'У AI временно закончился лимит запросов. Попробуйте позже.':'AI сейчас не смог ответить. Попробуйте ещё раз.'});}
-          const answer=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim();if(!answer)return send(res,502,{error:'AI прислал пустой ответ. Попробуйте ещё раз.'});
-          return send(res,200,{answer});
-        } catch(err) { console.error(`Gemini request failed: ${err.name||'Error'}`);return send(res,502,{error:'Не удалось связаться с AI. Попробуйте ещё раз.'}); }
+        const requestBody=JSON.stringify({systemInstruction:{parts:[{text:'Ты дружелюбный русскоязычный помощник сайта Fauna Violet. Отвечай понятно и доброжелательно, преимущественно о животных, природе и использовании сайта. Не выдумывай факты: если не уверен, прямо скажи об этом и предложи проверить надёжный источник. Не проси пароли, коды подтверждения или платёжные данные. Ответ до 180 слов.'}]},contents:[...history,{role:'user',parts:[{text:question}]}],generationConfig:{temperature:0.55,maxOutputTokens:700}});
+        let lastError=null;
+        for(let attempt=0;attempt<2;attempt++) {
+          try {
+            const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:requestBody,signal:AbortSignal.timeout(45000)});
+            const data=await response.json();
+            if(!response.ok) {
+              console.error(`Gemini API failed: HTTP ${response.status}`);
+              if((response.status===503||response.status===500)&&attempt===0){await new Promise(resolve=>setTimeout(resolve,1500));continue;}
+              return send(res,response.status===429?429:502,{error:response.status===429?'У AI временно закончился лимит запросов. Попробуйте позже.':'AI сейчас не смог ответить. Попробуйте ещё раз.'});
+            }
+            const answer=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim();if(!answer)return send(res,502,{error:'AI прислал пустой ответ. Попробуйте ещё раз.'});
+            return send(res,200,{answer});
+          } catch(err) {
+            lastError=err;
+            if(attempt===0&&(err.name==='TimeoutError'||err.name==='AbortError')){await new Promise(resolve=>setTimeout(resolve,1500));continue;}
+            break;
+          }
+        }
+        console.error(`Gemini request failed: ${lastError?.name||'Error'}`);
+        return send(res,502,{error:lastError?.name==='TimeoutError'||lastError?.name==='AbortError'?'Gemini долго не отвечает. Попробуйте ещё раз чуть позже.':'Не удалось связаться с AI. Попробуйте ещё раз.'});
       }
       if(url.pathname==='/api/animals/search' && req.method==='GET') {
         const q=String(url.searchParams.get('q')||'').trim().slice(0,100);
