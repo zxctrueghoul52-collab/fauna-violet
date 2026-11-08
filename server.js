@@ -125,7 +125,9 @@ async function route(req,res) {
             const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},body:requestBody,signal:AbortSignal.timeout(45000)});
             const data=await response.json();
             if(!response.ok) {
-              console.error(`Gemini API failed: HTTP ${response.status}`);
+              const apiErrorStatus=String(data.error?.status||'UNKNOWN').slice(0,80);
+              const apiErrorMessage=String(data.error?.message||'No error message returned').replace(/[\r\n\t]+/g,' ').slice(0,300);
+              console.error(`Gemini API failed: HTTP ${response.status} ${apiErrorStatus}: ${apiErrorMessage}`);
               if((response.status===503||response.status===500)&&attempt===0){await new Promise(resolve=>setTimeout(resolve,1500));continue;}
               return send(res,response.status===429?429:502,{error:response.status===429?'У AI временно закончился лимит запросов. Попробуйте позже.':'AI сейчас не смог ответить. Попробуйте ещё раз.'});
             }
