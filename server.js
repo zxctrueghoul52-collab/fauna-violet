@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { mkdirSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
-import { randomInt, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { randomInt, randomBytes, scrypt as scryptCb, timingSafeEqual, createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import nodemailer from 'nodemailer';
@@ -16,6 +16,8 @@ db.exec(`PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS verification_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);`);
 const sessions = new Map();
+const adminSessions = new Map();
+const adminFailures = new Map();
 const pendingPasswords = new Map();
 const smtpReady = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM);
 const resendReady = !!(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
@@ -24,10 +26,13 @@ const emailReady = brevoReady || resendReady || smtpReady;
 const mailer = smtpReady ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }) : null;
 const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.svg':'image/svg+xml' };
 
-function send(res, status, data, cookie='') { res.writeHead(status, { 'content-type':'application/json; charset=utf-8', 'set-cookie': cookie, 'cache-control':'no-store' }); res.end(JSON.stringify(data)); }
+function send(res, status, data, cookie='') { res.writeHead(status, { 'content-type':'application/json; charset=utf-8', 'set-cookie': cookie, 'cache-control':'no-store', 'x-content-type-options':'nosniff', 'x-frame-options':'DENY', 'referrer-policy':'no-referrer' }); res.end(JSON.stringify(data)); }
 async function body(req) { let s=''; for await (const c of req) { s+=c; if (s.length>12000) throw Error('too large'); } return JSON.parse(s || '{}'); }
 function emailOk(x) { return typeof x==='string' && x.length<=254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x); }
 function sessionUser(req) { const raw=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_session='))?.split('=')[1]; const email=raw && sessions.get(raw); return email ? db.prepare('SELECT id,email,verified FROM users WHERE email=?').get(email) : null; }
+function adminToken(req) { return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('fauna_admin='))?.slice('fauna_admin='.length); }
+function isAdmin(req) { const token=adminToken(req), expires=token&&adminSessions.get(token); if(!expires)return false; if(expires<Date.now()){adminSessions.delete(token);return false} adminSessions.set(token,Date.now()+60*60*1000); return true; }
+function fixedEqual(a,b) { return timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest()); }
 async function sendEmail(to,subject,textBody,htmlBody) {
   if(brevoReady) {
     const response=await fetch('https://api.brevo.com/v3/smtp/email',{method:'POST',headers:{'api-key':process.env.BREVO_API_KEY,'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({sender:{name:process.env.BREVO_FROM_NAME,email:process.env.BREVO_FROM_EMAIL},to:[{email:to}],subject,textContent:textBody,htmlContent:htmlBody}),signal:AbortSignal.timeout(15000)});
@@ -43,6 +48,27 @@ async function route(req,res) {
   if (url.pathname.startsWith('/api/')) {
     try {
       const input=['POST'].includes(req.method) ? await body(req) : {};
+      if(url.pathname==='/api/admin/login' && req.method==='POST') {
+        const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',').at(-1).trim();
+        const attempt=adminFailures.get(ip), now=Date.now();
+        if(attempt && attempt.until>now && attempt.count>=5) return send(res,429,{error:'Слишком много попыток. Попробуйте снова через 15 минут.'});
+        const configuredEmail=String(process.env.ADMIN_EMAIL||'').trim().toLowerCase(), configuredPassword=String(process.env.ADMIN_PASSWORD||'');
+        if(!configuredEmail||configuredPassword.length<16) return send(res,503,{error:'Настройте ADMIN_EMAIL и ADMIN_PASSWORD в Railway → Variables.'});
+        const email=String(input.email||'').trim().toLowerCase(), password=String(input.password||'');
+        const valid=fixedEqual(email,configuredEmail)&&fixedEqual(password,configuredPassword);
+        if(!valid) { const current=attempt&&attempt.until>now?attempt:{count:0,until:now+15*60*1000}; current.count++;adminFailures.set(ip,current);return send(res,401,{error:'Почта администратора или пароль неверны.'}); }
+        adminFailures.delete(ip);
+        const token=randomBytes(32).toString('hex');adminSessions.set(token,now+60*60*1000);
+        return send(res,200,{ok:true},`fauna_admin=${token}; HttpOnly; SameSite=Strict; Path=/api/admin; Max-Age=3600${process.env.NODE_ENV==='production'?'; Secure':''}`);
+      }
+      if(url.pathname==='/api/admin/me' && req.method==='GET') return isAdmin(req)?send(res,200,{ok:true}):send(res,401,{error:'Требуется вход администратора.'});
+      if(url.pathname==='/api/admin/logout' && req.method==='POST') { const token=adminToken(req);if(token)adminSessions.delete(token);return send(res,200,{ok:true},'fauna_admin=; HttpOnly; SameSite=Strict; Path=/api/admin; Max-Age=0'+(process.env.NODE_ENV==='production'?'; Secure':'')); }
+      if(url.pathname==='/api/admin/users' && req.method==='GET') {
+        if(!isAdmin(req)) return send(res,401,{error:'Требуется вход администратора.'});
+        const rows=db.prepare('SELECT id,email,verified,created_at FROM users ORDER BY id DESC').all();
+        const summary=db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified FROM users').get();
+        return send(res,200,{users:rows,summary:{total:summary.total,verified:summary.verified||0}});
+      }
       if(url.pathname==='/api/forgot' && req.method==='POST') {
         const email=String(input.email||'').trim().toLowerCase();
         if(!emailOk(email)) return send(res,400,{error:'Введите корректный адрес почты.'});
@@ -132,9 +158,13 @@ async function route(req,res) {
       return send(res,404,{error:'Не найдено.'});
     } catch(e) { console.error(e); return send(res,500,{error:'Что-то пошло не так. Попробуйте ещё раз.'}); }
   }
+  if(url.pathname==='/admin' || url.pathname==='/admin/') {
+    try { const data=await readFile(resolve(root,'public','admin.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'no-referrer','x-robots-tag':'noindex, nofollow','content-security-policy':"default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"});return res.end(data); }
+    catch { res.writeHead(404);return res.end('Not found'); }
+  }
   const path=url.pathname==='/'?'/index.html':url.pathname;
   if(path.includes('..')) { res.writeHead(400); return res.end(); }
-  try { const data=await readFile(resolve(root,'public',path.slice(1))); res.writeHead(200,{'content-type':mime[extname(path)]||'application/octet-stream'}); res.end(data); } catch { res.writeHead(404);res.end('Not found'); }
+  try { const data=await readFile(resolve(root,'public',path.slice(1))); res.writeHead(200,{'content-type':mime[extname(path)]||'application/octet-stream','x-content-type-options':'nosniff','x-frame-options':'DENY','referrer-policy':'no-referrer'}); res.end(data); } catch { res.writeHead(404);res.end('Not found'); }
 }
 const animals=[
 {id:'fox',name:'Рыжая лисица',latin:'Vulpes vulpes',group:'Лес',emoji:'🦊',color:'#d87845',image:'https://images.unsplash.com/photo-1588167056547-c183313da47c?auto=format&fit=crop&w=1200&q=85',fact:'Слышит движения мыши под снегом и точно рассчитывает прыжок.',habitat:'Леса, тундра, степи и даже окраины городов по всему Северному полушарию.',diet:'Грызуны, птицы, насекомые, ягоды и сезонные плоды.',lifespan:'Обычно 3–6 лет в природе',detail:'Рыжая лисица — один из самых приспособляемых хищников планеты. Её большие уши улавливают слабые звуки под снегом: заметив мышь, лисица делает высокий прыжок и ныряет мордой в сугроб. Длинный пушистый хвост помогает сохранять равновесие на повороте и служит тёплым укрытием во время сна. Лисицы живут в разнообразных местах — от северных лесов до пустынь — и меняют рацион в зависимости от сезона.'},
