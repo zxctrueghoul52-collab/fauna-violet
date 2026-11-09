@@ -70,7 +70,7 @@ async function route(req,res) {
   if (url.pathname.startsWith('/api/')) {
     try {
       if(url.pathname==='/api/stripe/webhook'&&req.method==='POST'){if(!process.env.STRIPE_WEBHOOK_SECRET)return send(res,503,{error:'Stripe webhook is not configured.'});return await handleStripeWebhook(req,res)}
-      const input=['POST','DELETE'].includes(req.method) ? await body(req,url.pathname==='/api/profile/avatar'?180000:url.pathname==='/api/profile/favorites'?60000:12000) : {};
+      const input=['POST','DELETE'].includes(req.method) ? await body(req,url.pathname==='/api/profile/avatar'?180000:url.pathname==='/api/profile/favorites'?600000:12000) : {};
       if(url.pathname==='/api/plans'&&req.method==='GET') { const user=sessionUser(req),month=currentMonth(),subject=searchSubject(req,user),usage=db.prepare('SELECT used FROM animal_search_usage WHERE subject=? AND month=?').get(subject,month)?.used||0,plan=effectivePlan(user);return send(res,200,{plans:Object.values(PLANS),currentPlan:plan,searchesUsed:usage,searchLimit:PLANS[plan].monthlySearchLimit,checkoutReady:stripeReady,hasSubscription:!!(user?.stripe_subscription_id&&['active','trialing','past_due'].includes(user.subscription_status))}); }
       if(url.pathname==='/api/checkout'&&req.method==='POST') {
         const user=sessionUser(req);if(!user?.verified)return send(res,401,{error:'Войдите в подтверждённый аккаунт, чтобы оформить подписку.'});
@@ -169,6 +169,15 @@ async function route(req,res) {
         if(!account)return send(res,404,{error:'Пользователь не найден.'});
         db.prepare('DELETE FROM animal_search_usage WHERE subject=? AND month=?').run(`user:${userId}`,currentMonth());
         auditAdmin(account,'search_limit_reset','Current month search usage reset to zero.');
+        return send(res,200,{ok:true});
+      }
+      const adminResetFavorites=url.pathname.match(/^\/api\/admin\/users\/(\d+)\/reset-favorites$/);
+      if(adminResetFavorites&&req.method==='POST') {
+        if(!isAdmin(req))return send(res,401,{error:'Требуется вход администратора.'});
+        const userId=Number(adminResetFavorites[1]),account=db.prepare('SELECT id,email FROM users WHERE id=?').get(userId);
+        if(!account)return send(res,404,{error:'Пользователь не найден.'});
+        db.prepare("UPDATE users SET favorites_data='[]' WHERE id=?").run(userId);db.prepare('DELETE FROM animal_favorites WHERE user_id=?').run(userId);
+        auditAdmin(account,'favorites_cleared','Administrator cleared saved animals.');
         return send(res,200,{ok:true});
       }
       const adminUserDelete=url.pathname.match(/^\/api\/admin\/users\/(\d+)$/);
