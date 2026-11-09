@@ -190,3 +190,6 @@ body { background: #06111d; color: var(--text); }
 @media (prefers-reduced-motion: reduce) {
   .brand, .brand-mark, .nav a, .nav-link, .user-actions > button, .menu-toggle, .filter, .card-favorite { transition: none !important; }
 }
+
+.animal-card { position: relative; }
+
